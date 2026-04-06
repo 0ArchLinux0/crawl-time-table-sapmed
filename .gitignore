@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Generated & debug (keep empty artifacts/ via .gitkeep)
+schedule.json
+artifacts/*
+!artifacts/.gitkeep
+
+# Editor
+.cursor/
