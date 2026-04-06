@@ -35,11 +35,13 @@ if ($Phase -eq 'After0500') {
     exit 0
 }
 
-# After0700: if nothing ran since today's 07:00, run once (covers missed 07:00 task).
+# After0700: catch missed 07:00 task — no stamp today, or only a pre-07:00 run today.
 $sevenAm = Get-Date -Hour 7 -Minute 0 -Second 0 -Millisecond 0
-if ($null -eq $last -or ($last.Date -eq $now.Date -and $last -lt $sevenAm)) {
-    if ($now -ge $sevenAm.AddMinutes(20)) {
-        Invoke-Pipeline
-    }
+if ($now -lt $sevenAm.AddMinutes(20)) { exit 0 }
+
+$stale = ($null -eq $last) -or ($last.Date -lt $now.Date)
+$onlyEarly = (-not $stale) -and ($last.Date -eq $now.Date) -and ($last -lt $sevenAm)
+if ($stale -or $onlyEarly) {
+    Invoke-Pipeline
 }
 exit 0
