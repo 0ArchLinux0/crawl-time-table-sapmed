@@ -9,6 +9,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+SYNC_LOG_TZ = ZoneInfo("Asia/Tokyo")
 
 # Period upsert: select options 1–7 (covers most timetables; API accepts new names on write anyway).
 _PERIOD_SELECT_OPTIONS = [{"name": str(i)} for i in range(1, 8)]
@@ -61,6 +63,107 @@ def _notion_headers(token: str) -> dict[str, str]:
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
+
+
+def _sync_log_target_page_id(token: str, db_id: str) -> str | None:
+    """
+    Page whose blocks we append to (bottom of page = below inline DB if the DB lives on that page).
+    NOTION_SYNC_LOG_PAGE_ID overrides; else parent page of the database when parent is a page.
+    """
+    explicit = (os.getenv("NOTION_SYNC_LOG_PAGE_ID") or "").strip()
+    if explicit:
+        return explicit
+    data = _fetch_database(token, db_id)
+    parent = data.get("parent") or {}
+    if parent.get("type") == "page_id":
+        return str(parent.get("page_id") or "")
+    return None
+
+
+def _notion_append_block_children(token: str, block_id: str, children: list[dict[str, Any]]) -> None:
+    url = f"{NOTION_API_BASE}/blocks/{block_id}/children"
+    r = requests.patch(
+        url,
+        headers=_notion_headers(token),
+        json={"children": children},
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:600]}
+        raise RuntimeError(f"append blocks failed: {r.status_code} {body}")
+
+
+def _write_sync_log_entry(
+    token: str,
+    page_id: str,
+    *,
+    row_count: int,
+    elapsed_s: float,
+    wiped: bool,
+    style: str,
+) -> None:
+    now = datetime.now(SYNC_LOG_TZ)
+    ts = now.strftime("%Y-%m-%d %H:%M:%S")
+    summary = f"{ts} (JST) · 일정 {row_count}건 반영 완료"
+    detail = f"소요 {elapsed_s:.1f}s"
+    if wiped:
+        detail += " · wipe-first(기존 행 아카이브 후 재삽입)"
+    detail = detail[:1900]
+    summary = summary[:1900]
+
+    def _rt(s: str) -> list[dict[str, Any]]:
+        return [{"type": "text", "text": {"content": s}}]
+
+    children: list[dict[str, Any]]
+    if style == "bullet":
+        line = f"{summary} — {detail}"
+        children = [
+            {
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": _rt(line)},
+            }
+        ]
+    else:
+        # Default: toggle (제목 한 줄 + 펼치면 상세)
+        children = [
+            {
+                "object": "block",
+                "type": "toggle",
+                "toggle": {
+                    "rich_text": _rt(summary),
+                    "children": [
+                        {
+                            "object": "block",
+                            "type": "bulleted_list_item",
+                            "bulleted_list_item": {"rich_text": _rt(detail)},
+                        }
+                    ],
+                },
+            }
+        ]
+
+    try:
+        _notion_append_block_children(token, page_id, children)
+    except Exception as first:
+        if style != "bullet":
+            logging.warning("Sync log (toggle) failed, retry as bullet: %s", first)
+            _notion_append_block_children(
+                token,
+                page_id,
+                [
+                    {
+                        "object": "block",
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {"rich_text": _rt(f"{summary} — {detail}")},
+                    }
+                ],
+            )
+        else:
+            raise
 
 
 def _date_property_payload(row: NotionScheduleRow) -> dict[str, Any]:
@@ -585,6 +688,17 @@ def main() -> None:
         action="store_true",
         help="Archive all rows in the target database before syncing (dedupe after date-format changes).",
     )
+    ap.add_argument(
+        "--no-sync-log",
+        action="store_true",
+        help="Do not append 갱신 이력 (toggle/bullet) to a Notion page.",
+    )
+    ap.add_argument(
+        "--sync-log-style",
+        choices=["toggle", "bullet"],
+        default=None,
+        help="Sync history block style (default: NOTION_SYNC_LOG_STYLE env or toggle).",
+    )
     args = ap.parse_args()
 
     _setup_logging(args.log_level)
@@ -639,6 +753,33 @@ def main() -> None:
 
     elapsed = (datetime.now() - started).total_seconds()
     logging.info("Done. upserted=%s elapsed_s=%.2f", len(rows), elapsed)
+
+    if not args.no_sync_log:
+        log_page = _sync_log_target_page_id(token, db_id)
+        if log_page:
+            style = (args.sync_log_style or os.getenv("NOTION_SYNC_LOG_STYLE") or "toggle").strip().lower()
+            if style not in ("toggle", "bullet"):
+                style = "toggle"
+            try:
+                _write_sync_log_entry(
+                    token,
+                    log_page,
+                    row_count=len(rows),
+                    elapsed_s=elapsed,
+                    wiped=bool(args.wipe_first),
+                    style=style,
+                )
+                logging.info("Notion 갱신 이력을 페이지에 추가함 (page_id=%s)", log_page)
+            except Exception as e:
+                logging.warning(
+                    "갱신 이력 블록 추가 실패(해당 페이지를 연동에 공유했는지 확인): %s",
+                    e,
+                )
+        else:
+            logging.info(
+                "갱신 이력 생략: DB가 워크스페이스 직속이거나 부모를 알 수 없음. "
+                "별도 페이지에 쓰려면 .env에 NOTION_SYNC_LOG_PAGE_ID=<페이지 URL의 ID> 를 넣으세요."
+            )
 
 
 if __name__ == "__main__":
