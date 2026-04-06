@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import Any, Literal
@@ -15,6 +16,15 @@ from playwright.async_api import Browser, Page, async_playwright
 
 
 PORTAL_URL = "https://cp-portal.sapmed.ac.jp/portal/#"
+
+# SMU portal period → official slot (not scraped; overwrites cell/tooltip times for P1–P5).
+PERIOD_SLOT_TIMES: dict[str, tuple[time, time]] = {
+    "1": (time(9, 0), time(10, 30)),
+    "2": (time(10, 40), time(12, 10)),
+    "3": (time(13, 10), time(14, 40)),
+    "4": (time(14, 50), time(16, 20)),
+    "5": (time(16, 30), time(18, 0)),
+}
 
 
 @dataclass(frozen=True)
@@ -77,6 +87,38 @@ def apply_room_overrides(items: list[ScheduleItem]) -> list[ScheduleItem]:
                 raw=it.raw,
             )
         )
+    return out
+
+
+def _normalize_period_key(period: str) -> str:
+    """e.g. '１', '1限' -> '1' for slot lookup."""
+    p = unicodedata.normalize("NFKC", (period or "").strip())
+    m = re.match(r"^(\d+)", p)
+    return m.group(1) if m else ""
+
+
+def apply_period_slot_times(items: list[ScheduleItem]) -> list[ScheduleItem]:
+    """Set start/end from official timetable for periods 1–5; leave other periods unchanged."""
+    out: list[ScheduleItem] = []
+    for it in items:
+        key = _normalize_period_key(it.period)
+        slot = PERIOD_SLOT_TIMES.get(key)
+        if slot:
+            st, en = slot
+            out.append(
+                ScheduleItem(
+                    day=it.day,
+                    period=it.period,
+                    subject=it.subject,
+                    start=st,
+                    end=en,
+                    room=it.room,
+                    code=it.code,
+                    raw=it.raw,
+                )
+            )
+        else:
+            out.append(it)
     return out
 
 
@@ -914,7 +956,6 @@ async def parse_weekly_schedule(page: Page, *, details_mode: Literal["js", "hove
     # Strategy 2: hover tooltip (for room/code) — user confirmed it contains date (top 1-2 lines) and room at '教室:'.
     if details_mode == "hover":
         items = await _parse_weekly_blocks_hover(page)
-        items = apply_room_overrides(items)
         logging.info("[PARSE_SUMMARY] extracted_items=%s non_empty_cells=%s", len(items), len(items))
         return items
 
@@ -1239,6 +1280,8 @@ async def run(
             await login(page, user, pw)
             logging.info("Parsing weekly schedule...")
             items = await parse_weekly_schedule(page, details_mode=details_mode)
+            items = apply_room_overrides(items)
+            items = apply_period_slot_times(items)
 
             if save_storage_state:
                 os.makedirs(os.path.dirname(save_storage_state) or ".", exist_ok=True)

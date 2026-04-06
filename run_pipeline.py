@@ -1,6 +1,7 @@
 """
 Run portal scraper → schedule.json → Notion sync.
-Intended for Windows Task Scheduler (5:00 / 7:00) and watchdog retries.
+스케줄러용: Notion은 전부 비우지 않고 날짜+교시 기준으로 행만 갱신·추가(upsert).
+전체 초기화는 수동으로 notion_sync.py --wipe-first.
 """
 from __future__ import annotations
 

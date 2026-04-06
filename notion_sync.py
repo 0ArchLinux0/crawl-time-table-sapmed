@@ -166,9 +166,25 @@ def _write_sync_log_entry(
             raise
 
 
-def _date_property_payload(row: NotionScheduleRow) -> dict[str, Any]:
-    """Notion `date` property: calendar date only (YYYY-MM-DD). Period/times live in other columns."""
+def _to_iso(dt_date: str, hhmm: str | None, *, tz_offset: str = "+09:00") -> str:
+    if not hhmm:
+        return f"{dt_date}T00:00:00{tz_offset}"
+    parts = hhmm.strip().split(":")
+    h = int(parts[0])
+    m = int(parts[1]) if len(parts) > 1 else 0
+    return f"{dt_date}T{h:02d}:{m:02d}:00{tz_offset}"
+
+
+def _date_property_payload(row: NotionScheduleRow, *, tz_offset: str = "+09:00") -> dict[str, Any]:
+    """Notion date: include time range when JSON has start/end (교시별 고정 시간대)."""
     d = (row.date or "").strip()
+    if row.start and row.end:
+        return {
+            "date": {
+                "start": _to_iso(d, row.start, tz_offset=tz_offset),
+                "end": _to_iso(d, row.end, tz_offset=tz_offset),
+            }
+        }
     return {"date": {"start": d}}
 
 
@@ -466,6 +482,18 @@ def _period_filter_clause(prop_period: str, period: str, ptype: str) -> dict[str
     return {"property": prop_period, "select": {"equals": period}}
 
 
+def _archive_single_page(token: str, page_id: str) -> None:
+    url = f"{NOTION_API_BASE}/pages/{page_id}"
+    r = requests.patch(url, headers=_notion_headers(token), json={"archived": True}, timeout=30)
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:400]}
+        raise RuntimeError(f"archive page {page_id}: {r.status_code} {body}")
+    r.raise_for_status()
+
+
 def archive_all_pages_in_database(token: str, db_id: str) -> int:
     """Archive every non-archived row in the database (Notion trash / restore possible). Returns count."""
     qurl = f"{NOTION_API_BASE}/databases/{db_id}/query"
@@ -489,18 +517,11 @@ def archive_all_pages_in_database(token: str, db_id: str) -> int:
             pid = page.get("id")
             if not pid:
                 continue
-            pr = requests.patch(
-                f"{NOTION_API_BASE}/pages/{pid}",
-                headers=_notion_headers(token),
-                json={"archived": True},
-                timeout=30,
-            )
-            if pr.status_code >= 400:
-                try:
-                    logging.error("Archive page failed: %s", pr.json())
-                except Exception:
-                    logging.error("Archive page failed: %s", pr.text[:800])
-                pr.raise_for_status()
+            try:
+                _archive_single_page(token, pid)
+            except Exception as e:
+                logging.error("Archive page failed: %s", e)
+                raise
             archived += 1
         if not data.get("has_more"):
             break
@@ -531,32 +552,65 @@ def notion_query_existing(
 
     period_clause = _period_filter_clause(prop_period, period, period_type)
 
-    payload: dict[str, Any] = {
-        "page_size": 5,
-        "filter": {"and": [date_clause, period_clause]},
-    }
-    r = requests.post(url, headers=_notion_headers(token), json=payload, timeout=30)
-    if r.status_code == 404:
-        raise RuntimeError(
-            "Notion database not found (404). "
-            "Check NOTION_DB_ID format and that the integration has access to the database."
-        )
-    if r.status_code >= 400:
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text[:500]}
-        logging.error("Notion query failed: status=%s body=%s", r.status_code, body)
-        raise RuntimeError(
-            f"Notion database query failed ({r.status_code}). "
-            f"Usually: property names must match DB exactly, and filter types must match "
-            f"(e.g. 교시 as Number needs number filter, not select). Notion says: {body}"
-        ) from None
-    res = r.json()
-    results = res.get("results") or []
-    if not results:
+    filt: dict[str, Any] = {"and": [date_clause, period_clause]}
+    all_results: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        payload: dict[str, Any] = {"page_size": 100, "filter": filt}
+        if cursor:
+            payload["start_cursor"] = cursor
+        r = requests.post(url, headers=_notion_headers(token), json=payload, timeout=30)
+        if r.status_code == 404:
+            raise RuntimeError(
+                "Notion database not found (404). "
+                "Check NOTION_DB_ID format and that the integration has access to the database."
+            )
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:500]}
+            logging.error("Notion query failed: status=%s body=%s", r.status_code, body)
+            raise RuntimeError(
+                f"Notion database query failed ({r.status_code}). "
+                f"Usually: property names must match DB exactly, and filter types must match "
+                f"(e.g. 교시 as Number needs number filter, not select). Notion says: {body}"
+            ) from None
+        res = r.json()
+        all_results.extend(res.get("results") or [])
+        if not res.get("has_more"):
+            break
+        cursor = res.get("next_cursor")
+
+    if not all_results:
         return None
-    return results[0]
+    if len(all_results) == 1:
+        return all_results[0]
+
+    # 같은 날짜+교시로 여러 행이 있으면(예: 예전 날짜 표기 버그) 최근 수정 1개만 남기고 나머지는 아카이브.
+    sorted_r = sorted(
+        all_results,
+        key=lambda p: str(p.get("last_edited_time") or ""),
+        reverse=True,
+    )
+    keeper = sorted_r[0]
+    for dup in sorted_r[1:]:
+        dup_id = dup.get("id")
+        if not dup_id:
+            continue
+        try:
+            _archive_single_page(token, dup_id)
+            logging.warning(
+                "Duplicate row for %s P%s → archived %s (keeping %s)",
+                date_str,
+                period,
+                dup_id,
+                keeper.get("id"),
+            )
+        except Exception as e:
+            logging.error("Could not archive duplicate %s: %s", dup_id, e)
+            raise
+    return keeper
 
 
 def _get_title(page: dict[str, Any], prop_title: str) -> str:
@@ -608,6 +662,7 @@ def notion_create_or_update(
     prop_period: str,
     prop_room: str,
     prop_types: dict[str, str],
+    tz_offset: str = "+09:00",
 ) -> None:
     existing = notion_query_existing(
         token=token,
@@ -627,7 +682,7 @@ def notion_create_or_update(
     props: dict[str, Any] = {
         prop_title: {"title": [{"text": {"content": title_text}}]},
         prop_period: _period_property_value(row.period, period_type),
-        prop_date: _date_property_payload(row),
+        prop_date: _date_property_payload(row, tz_offset=tz_offset),
         prop_room: _room_property_value(row.room, room_type),
     }
 
@@ -674,6 +729,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Upsert SMU schedule JSON into Notion database")
     ap.add_argument("--input", default=None, help="Path to JSON file from scraper.py (default: stdin)")
     ap.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
+    ap.add_argument(
+        "--tz-offset",
+        default="+09:00",
+        help="Offset for Notion datetime when start/end present (default: Japan)",
+    )
     ap.add_argument("--prop-title", default="강의명", help="Preferred Title column name (auto-schema uses the DB's only Title column)")
     ap.add_argument("--prop-date", default="날짜", help="Preferred Date property name (wrong type → API adds SMU_수업일)")
     ap.add_argument("--prop-period", default="교시", help="Preferred period property (select|number|multi_select)")
@@ -686,7 +746,7 @@ def main() -> None:
     ap.add_argument(
         "--wipe-first",
         action="store_true",
-        help="Archive all rows in the target database before syncing (dedupe after date-format changes).",
+        help="비우고 다시 넣기: DB 전체 아카이브 후 삽입. 평소엔 쓰지 말 것(기본은 날짜+교시로 행만 수정·추가).",
     )
     ap.add_argument(
         "--no-sync-log",
@@ -732,8 +792,11 @@ def main() -> None:
     logging.info("Loaded %s rows from scraper JSON", len(rows))
 
     if args.wipe_first:
+        logging.warning("wipe-first: 전체 아카이브 후 재삽입 모드")
         n = archive_all_pages_in_database(token, db_id)
         logging.warning("Archived %s existing database row(s); re-inserting from JSON.", n)
+    else:
+        logging.info("upsert: 날짜+교시 키로 갱신/추가; 동일 키 중복 행은 최근 1개만 남김")
 
     # Deterministic order makes diffs/alerts easier to read.
     rows = sorted(rows, key=lambda r: (r.date, int(r.period) if r.period.isdigit() else 999, r.subject))
@@ -749,6 +812,7 @@ def main() -> None:
             prop_period=resolved.prop_period,
             prop_room=resolved.prop_room,
             prop_types=prop_types,
+            tz_offset=args.tz_offset,
         )
 
     elapsed = (datetime.now() - started).total_seconds()
