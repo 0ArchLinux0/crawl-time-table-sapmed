@@ -18,7 +18,16 @@ $Pwsh = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-Path $Pipeline)) { throw "Missing run_pipeline.py at $Pipeline" }
 
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+# WakeToRun: 절전 중이면 예약 시각에 PC 깨우기 시도(바이오스/전원에서 막으면 안 됨).
+# MultipleInstances IgnoreNew: 이전 실행이 길게 남아 있으면 겹쳐 돌리지 않음.
+# ExecutionTimeLimit: 스크래퍼 멈춤 대비 상한(2h).
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -WakeToRun `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 2)
 
 function Register-OurTask {
     param(
