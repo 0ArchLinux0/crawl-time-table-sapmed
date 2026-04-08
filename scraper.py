@@ -8,7 +8,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from typing import Any, Literal
 
 from dotenv import load_dotenv
@@ -25,6 +25,15 @@ PERIOD_SLOT_TIMES: dict[str, tuple[time, time]] = {
     "4": (time(14, 50), time(16, 20)),
     "5": (time(16, 30), time(18, 0)),
 }
+
+# 포털에 강의실이 안 뜰 때 Notion/JSON에 넣을 고정값 (사용자 확정)
+ROOM_ENGLISH1_ZENKI = "ｳｨｰﾗｰ：D402"
+ROOM_ENGLISH1_ZENKI_JUNE09 = "ｳｨｰﾗｰ：C302"  # 6/9 例외
+ROOM_ENGLISH1_KOUKI = "白土：D101"
+ROOM_RUSSIAN = "D502（多目的演習室）"
+ROOM_EIKAIWA_ZENKI_SUGARMAN = "D303"
+ROOM_EIKAIWA_KOUKI = "ｹｲﾝ：D401"
+ROOM_EIKAIWA_KOUKI_JUNE10 = "ｹｲﾝ：C301"
 
 
 @dataclass(frozen=True)
@@ -44,11 +53,39 @@ def _infer_term(d: date) -> Literal["前期", "後期"]:
     return "前期" if 4 <= d.month <= 9 else "後期"
 
 
+def _subject_is_russian(subj: str) -> bool:
+    """ロシア語 / 露語 / 캘린더에 '露'만 올라오는 경우 등."""
+    s = unicodedata.normalize("NFKC", (subj or "").strip())
+    s = s.replace("\u3000", " ")
+    if "ロシア" in s:
+        return True
+    if "露語" in s:
+        return True
+    if s == "露":
+        return True
+    if "ロシア語" in s:
+        return True
+    return False
+
+
+def _room_effectively_missing(room: str | None) -> bool:
+    """포털이 강의실을 안 준 경우만 고정값 채움(스크랩 값이 있으면 그대로 둠)."""
+    if room is None:
+        return True
+    s = unicodedata.normalize("NFKC", str(room).strip()).replace("\u3000", " ")
+    if not s:
+        return True
+    if s in {":", "：", "F", "Ｆ"}:
+        return True
+    return False
+
+
 def apply_room_overrides(items: list[ScheduleItem]) -> list[ScheduleItem]:
     """
-    Apply known room exception rules provided by user.
-    - 英語1: 前期 기본 ｳｨｰﾗｰ：D402, 단 6/9만 C302. 後기 白土：D101
-    - 英会話: 전기 ﾘｰﾑｽﾄ：D502（多目的演習室）, 후기 ｹｲﾝ：D401, 단 6/10만 C301
+    아래 과목만, 포털에 강의실이 비어 있을 때 규칙으로 채움. 그 외·스크랩에 룸이 있으면 파싱값 유지.
+    - 医学英語1/英語1: 前期 D402(6/9만 C302), 後期 白土 D101
+    - ロシア語系: D502（多目的演習室）
+    - 英会話: apply_user_schedule_postprocess (같은 조건으로 룸 보정)
     """
     out: list[ScheduleItem] = []
     for it in items:
@@ -58,22 +95,20 @@ def apply_room_overrides(items: list[ScheduleItem]) -> list[ScheduleItem]:
 
         # English 1 (医学英語1 / 英語1)
         if re.search(r"(医学英語\s*[１1]|英語\s*[１1])", subj):
-            if term == "前期":
-                # Default
-                room = "ｳｨｰﾗｰ：D402"
-                if it.day.month == 6 and it.day.day == 9:
-                    room = "ｳｨｰﾗｰ：C302"
-            else:
-                room = "白土：D101"
+            if _room_effectively_missing(room):
+                if term == "前期":
+                    room = ROOM_ENGLISH1_ZENKI
+                    if it.day.month == 6 and it.day.day == 9:
+                        room = ROOM_ENGLISH1_ZENKI_JUNE09
+                else:
+                    room = ROOM_ENGLISH1_KOUKI
 
-        # English conversation
-        if "英会話" in subj:
-            if term == "前期":
-                room = "ﾘｰﾑｽﾄ：D502（多目的演習室）"
-            else:
-                room = "ｹｲﾝ：D401"
-            if it.day.month == 6 and it.day.day == 10:
-                room = "ｹｲﾝ：C301"
+        # Russian — site often omits room
+        elif _subject_is_russian(subj):
+            if _room_effectively_missing(room):
+                room = ROOM_RUSSIAN
+
+        # 英会話は apply_user_schedule_postprocess で学期별 정리
 
         out.append(
             ScheduleItem(
@@ -88,6 +123,274 @@ def apply_room_overrides(items: list[ScheduleItem]) -> list[ScheduleItem]:
             )
         )
     return out
+
+
+# 選択科目で履修しないため時間表に載せない（2026年度ユーザー設定）
+_EXCLUDED_ELECTIVE_MARKERS: tuple[str, ...] = (
+    "言語学",
+    "人類学",
+)
+
+
+def _nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", (s or ""))
+
+
+def apply_user_schedule_postprocess(items: list[ScheduleItem]) -> list[ScheduleItem]:
+    """
+    사용자 후처리:
+    - 言語学・人類学: 스크랩돼도 시간표(·Notion)에서 제외
+    - 英会話: 前期は シュガーマン 분만 유지, 표시 英会話(シュガーマン).
+      강의실은 포털이 비었을 때만 D303 등 규칙값; 스크랩 값이 있으면 유지.
+      후期は ウィーラー 분만 유지; 강의실도 동일.
+    """
+    out: list[ScheduleItem] = []
+    for it in items:
+        subj = (it.subject or "").strip()
+        s = subj.replace("\u3000", " ")
+        s = _nfkc(s)
+
+        if any(marker in s for marker in _EXCLUDED_ELECTIVE_MARKERS):
+            logging.info(
+                "[POSTPROCESS_DROP] elective_not_taken subject=%r date=%s P%s",
+                subj,
+                it.day.isoformat(),
+                it.period,
+            )
+            continue
+
+        if "英会話" not in s:
+            out.append(it)
+            continue
+
+        term = _infer_term(it.day)
+        has_sug = "シュガーマン" in s
+        has_wheel = "ウィーラー" in s
+        named = has_sug or has_wheel or "前：" in s or "後：" in s
+
+        if term == "前期":
+            if named and not has_sug:
+                logging.info(
+                    "[POSTPROCESS_DROP] eikaiwa_zenki_needs_sugarman subject=%r date=%s P%s",
+                    subj,
+                    it.day.isoformat(),
+                    it.period,
+                )
+                continue
+            new_room = (
+                ROOM_EIKAIWA_ZENKI_SUGARMAN
+                if _room_effectively_missing(it.room)
+                else it.room
+            )
+            out.append(
+                ScheduleItem(
+                    day=it.day,
+                    period=it.period,
+                    subject="英会話(シュガーマン)",
+                    start=it.start,
+                    end=it.end,
+                    room=new_room,
+                    code=it.code,
+                    raw=it.raw,
+                )
+            )
+            continue
+
+        # 後期: ウィーラー班のみ（前期教師名のみなら除く）
+        if named and has_sug and not has_wheel:
+            logging.info(
+                "[POSTPROCESS_DROP] eikaiwa_kouki_sugarman_only subject=%r date=%s P%s",
+                subj,
+                it.day.isoformat(),
+                it.period,
+            )
+            continue
+        rule_kouki = (
+            ROOM_EIKAIWA_KOUKI_JUNE10 if (it.day.month == 6 and it.day.day == 10) else ROOM_EIKAIWA_KOUKI
+        )
+        new_room = rule_kouki if _room_effectively_missing(it.room) else it.room
+        out.append(
+            ScheduleItem(
+                day=it.day,
+                period=it.period,
+                subject="英会話(ウィーラー)",
+                start=it.start,
+                end=it.end,
+                room=new_room,
+                code=it.code,
+                raw=it.raw,
+            )
+        )
+
+    logging.info(
+        "[POSTPROCESS_SUMMARY] items_after=%s (excludes 言語学/人類学; 英会話 normalized)",
+        len(out),
+    )
+    return out
+
+
+def apply_sibling_room_fallback(items: list[ScheduleItem]) -> list[ScheduleItem]:
+    """
+    같은 주 결과 안에서 (과목·교시)가 동일한 다른 칸에 room이 있으면, 비어 있는 칸에 복사.
+    특정 요일만 호버/툴팁이 비는 경우 보조.
+    """
+    from collections import Counter
+
+    def sp_key(it: ScheduleItem) -> tuple[str, str]:
+        return (
+            _nfkc((it.subject or "").strip()).casefold(),
+            _normalize_period_key(str(it.period)),
+        )
+
+    rooms_by: dict[tuple[str, str], list[str | None]] = {}
+    for it in items:
+        rooms_by.setdefault(sp_key(it), []).append(it.room)
+
+    def majority_room(vals: list[str | None]) -> str | None:
+        good = [v for v in vals if not _room_effectively_missing(v)]
+        if not good:
+            return None
+        return Counter(good).most_common(1)[0][0]
+
+    mode: dict[tuple[str, str], str | None] = {k: majority_room(v) for k, v in rooms_by.items()}
+    out: list[ScheduleItem] = []
+    filled = 0
+    for it in items:
+        if not _room_effectively_missing(it.room):
+            out.append(it)
+            continue
+        mr = mode.get(sp_key(it))
+        if mr:
+            filled += 1
+            out.append(
+                ScheduleItem(
+                    day=it.day,
+                    period=it.period,
+                    subject=it.subject,
+                    start=it.start,
+                    end=it.end,
+                    room=mr,
+                    code=it.code,
+                    raw=it.raw,
+                )
+            )
+        else:
+            out.append(it)
+    if filled:
+        logging.info("[ROOM_SIBLING] filled %s empty slot(s) from same subject+period in week", filled)
+    return out
+
+
+def apply_optional_room_hints(items: list[ScheduleItem]) -> list[ScheduleItem]:
+    """
+    저장소 루트의 room_hints.json — 과목명 부분 문자열 → 강의실 (포털이 안 줄 때만).
+    예: {"初年次セミナー": "教研1F D101"}  （room_hints.example.json 참고）
+    """
+    p = Path(__file__).resolve().parent / "room_hints.json"
+    if not p.is_file():
+        return items
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logging.warning("[ROOM_HINTS] skip %s: %s", p, e)
+        return items
+    if not isinstance(data, dict):
+        return items
+    out: list[ScheduleItem] = []
+    applied = 0
+    for it in items:
+        if not _room_effectively_missing(it.room):
+            out.append(it)
+            continue
+        subj_nf = _nfkc(it.subject or "").strip()
+        hint_room: str | None = None
+        for key, val in data.items():
+            if not isinstance(key, str) or not isinstance(val, str):
+                continue
+            k = _nfkc(key).strip()
+            vs = val.strip()
+            if not k or not vs:
+                continue
+            if k in subj_nf or k.casefold() in subj_nf.casefold():
+                hint_room = vs
+                break
+        if hint_room:
+            applied += 1
+            out.append(
+                ScheduleItem(
+                    day=it.day,
+                    period=it.period,
+                    subject=it.subject,
+                    start=it.start,
+                    end=it.end,
+                    room=hint_room,
+                    code=it.code,
+                    raw=it.raw,
+                )
+            )
+        else:
+            out.append(it)
+    if applied:
+        logging.info("[ROOM_HINTS] filled %s row(s) from room_hints.json", applied)
+    return out
+
+
+def collect_room_conflicts(
+    parsed_items: list[ScheduleItem],
+    final_items: list[ScheduleItem],
+) -> list[dict[str, str]]:
+    """
+    포털 원본(parsed)에 강의실 문자열이 있는데, 후처리 후 최종 값과 다르면 충돌로 본다.
+    (빈 스크랩 + 규칙으로 채운 경우는 제외 — 의도된 동작.)
+    """
+
+    def sig(r: str | None) -> str:
+        if not r or not str(r).strip():
+            return ""
+        return unicodedata.normalize("NFKC", str(r).strip()).casefold()
+
+    before_map: dict[tuple[str, str], tuple[str, str]] = {}
+    for it in parsed_items:
+        k = (it.day.isoformat(), str(it.period).strip())
+        before_map[k] = (it.subject or "", it.room or "")
+
+    out: list[dict[str, str]] = []
+    for it in final_items:
+        k = (it.day.isoformat(), str(it.period).strip())
+        if k not in before_map:
+            continue
+        osubj, oroom = before_map[k]
+        nsubj = it.subject or ""
+        nroom = it.room or ""
+        if sig(oroom) and sig(nroom) and sig(oroom) != sig(nroom):
+            out.append(
+                {
+                    "date": k[0],
+                    "period": k[1],
+                    "scraped_subject": osubj,
+                    "final_subject": nsubj,
+                    "scraped_room": oroom,
+                    "final_room": nroom,
+                }
+            )
+    if out:
+        logging.warning(
+            "[ROOM_CONFLICT] scraped vs rule-based room differ for %s slot(s); see artifacts/room_conflicts.json",
+            len(out),
+        )
+    return out
+
+
+def write_room_conflicts_artifact(conflicts: list[dict[str, str]]) -> None:
+    os.makedirs("artifacts", exist_ok=True)
+    path = os.path.join("artifacts", "room_conflicts.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"checked_at": datetime.now(timezone.utc).isoformat(), "conflicts": conflicts},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 def _normalize_period_key(period: str) -> str:
@@ -194,6 +497,132 @@ async def _dismiss_portal_warnings(page: Page) -> None:
         await page.wait_for_timeout(300)
 
 
+def _mask_login_identifier(ident: str) -> str:
+    """Log-safe: never print full UPN in logs (still enough to see domain / typo class)."""
+    s = (ident or "").strip()
+    if not s:
+        return "(empty)"
+    if "@" not in s:
+        return f"{s[:2]}***" if len(s) > 2 else "***"
+    local, _, domain = s.partition("@")
+    return f"{local[:2]}***@{domain}" if len(local) > 2 else f"***@{domain}"
+
+
+async def _microsoft_stay_signed_in_kmsi(page: Page) -> None:
+    """
+    Microsoft 「サインインの状態を維持しますか？」 / Stay signed in?
+    Prefer はい + 「今後このメッセージを表示しない」 so automated runs hit SSO less often.
+    """
+    try:
+        heading = page.get_by_text(re.compile(r"(サインインの状態を維持|Stay signed in)", re.I))
+        if not await heading.first.is_visible(timeout=15_000):
+            return
+    except Exception:
+        return
+
+    try:
+        for label_re in (
+            re.compile(r"今後このメッセージを表示しない"),
+            re.compile(r"Don't show this again", re.I),
+        ):
+            cb = page.get_by_role("checkbox", name=label_re)
+            if await cb.count() and await cb.first.is_visible(timeout=2000):
+                if not await cb.first.is_checked():
+                    await cb.first.check()
+                break
+        else:
+            generic = page.locator("input[type='checkbox']").first
+            if await generic.is_visible(timeout=1500) and not await generic.is_checked():
+                await generic.check()
+    except Exception:
+        pass
+
+    try:
+        yes = page.get_by_role("button", name=re.compile(r"^(はい|Yes)$", re.I))
+        if await yes.first.is_visible(timeout=8000):
+            await yes.first.click()
+            await page.wait_for_timeout(600)
+            logging.info("Microsoft login: confirmed 'Stay signed in' (はい) for longer-lived session")
+            return
+    except Exception:
+        pass
+
+    try:
+        no_btn = page.get_by_role("button", name=re.compile(r"^(いいえ|No)$", re.I))
+        if await no_btn.first.is_visible(timeout=3000):
+            await no_btn.first.click()
+            await page.wait_for_timeout(400)
+            logging.info("Microsoft login: clicked いいえ on Stay signed in (fallback)")
+    except Exception:
+        pass
+
+
+async def _microsoft_bypass_account_picker(page: Page) -> None:
+    """
+    Azure AD sometimes opens on 'pick an account' (saved sessions) with no email <input> yet.
+    We must open the real identifier form — usually 'Use another account' / 別のアカウントを使用する.
+    """
+    try:
+        other = page.get_by_text(
+            re.compile(r"(別のアカウントを使用する|別のワークまたは\s*学校アカウント|Use another account)", re.I)
+        )
+        if await other.first.is_visible(timeout=2500):
+            await other.first.click(timeout=5000)
+            await page.wait_for_timeout(600)
+            logging.info("Microsoft login: clicked 'use another account' to reach email form")
+            return
+    except Exception:
+        pass
+    # Tile / link variants
+    for pat in [
+        re.compile(r"^別のアカウントを使用する$"),
+        re.compile(r"^Use another account$", re.I),
+    ]:
+        try:
+            loc = page.get_by_role("link", name=pat)
+            if await loc.first.is_visible(timeout=800):
+                await loc.first.click(timeout=5000)
+                await page.wait_for_timeout(600)
+                logging.info("Microsoft login: bypassed account picker (link)")
+                return
+        except Exception:
+            continue
+
+
+async def _microsoft_login_page_diagnostics(page: Page) -> str:
+    """
+    Best-effort: surface Azure AD / Microsoft sign-in error text that our heuristic skipped.
+    The generic RuntimeError used to mean only "password field did not appear".
+    """
+    parts: list[str] = []
+    selectors = [
+        "#usernameError",
+        "#passwordError",
+        '[id*="usernameError" i]',
+        '[id*="PasswordError" i]',
+        '[id*="LoginMessage" i]',
+        '[data-bind*="error" i]',
+        'div[role="alert"]',
+        ".error.pageLevel",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=400):
+                t = re.sub(r"\s+", " ", (await loc.inner_text()).strip())
+                if t and t not in parts:
+                    parts.append(f"{sel} → {t[:400]}")
+        except Exception:
+            continue
+    try:
+        title = await page.title()
+        if title:
+            parts.append(f"title={title.strip()[:120]}")
+    except Exception:
+        pass
+    return " | ".join(parts) if parts else "(no known error nodes matched)"
+
+
 async def login(page: Page, username: str, password: str) -> None:
     page.set_default_timeout(30_000)
     page.set_default_navigation_timeout(45_000)
@@ -230,6 +659,7 @@ async def login(page: Page, username: str, password: str) -> None:
         """
 
         async def try_identifier(identifier: str) -> bool:
+            await _microsoft_bypass_account_picker(page)
             email = page.locator('input[type="email"], input[name="loginfmt"], input[id="i0116"]')
             await email.wait_for(state="visible", timeout=30_000)
             await email.fill(identifier)
@@ -240,9 +670,11 @@ async def login(page: Page, username: str, password: str) -> None:
             await next_btn.first.click()
 
             # Success heuristic: password field becomes visible shortly after Next.
+            # Note: this is NOT "account rejected" — many states keep you on the email step
+            # (unknown user, federated redirect, throttling, UX change, slow network).
             pw = page.locator('input[type="password"], input[name="passwd"], #i0118')
             try:
-                await pw.wait_for(state="visible", timeout=4000)
+                await pw.wait_for(state="visible", timeout=12_000)
                 return True
             except Exception:
                 return False
@@ -261,18 +693,44 @@ async def login(page: Page, username: str, password: str) -> None:
             for d in [d for d in domains if d]:
                 identifiers.append(f"{username}@{d}")
 
+        # First paint may be account chooser, not the email field.
+        await _microsoft_bypass_account_picker(page)
+
         ok = False
         for ident in identifiers:
+            last_exc: str | None = None
             try:
                 ok = await try_identifier(ident)
-            except Exception:
+            except Exception as e:
                 ok = False
-            if ok:
+                last_exc = f"{type(e).__name__}: {e}"
+            if not ok:
+                hint = await _microsoft_login_page_diagnostics(page)
+                logging.warning(
+                    "Microsoft login: identifier did not reach password step (masked=%s). url=%s last_exc=%s hints=%s",
+                    _mask_login_identifier(ident),
+                    page.url,
+                    last_exc or "",
+                    hint,
+                )
+            else:
+                logging.info("Microsoft login: reached password step with masked identifier %s", _mask_login_identifier(ident))
                 break
+            last_exc = None
         if not ok:
+            hints = await _microsoft_login_page_diagnostics(page)
+            logging.error(
+                "Microsoft login: exhausted identifier list; never saw password field. url=%s hints=%s",
+                page.url,
+                hints,
+            )
             raise RuntimeError(
-                "Microsoft sign-in rejected the provided username/UPN. "
-                "Set PORTAL_USER to the full UPN/email, or set PORTAL_USER_DOMAIN to append a domain."
+                "Microsoft login: could not reach the password step after trying UPN variants. "
+                "This usually means (1) PORTAL_USER must be the full school email/UPN, "
+                "(2) wrong/typo domain → set PORTAL_USER_DOMAIN, "
+                "(3) account requires a different sign-in flow (federated/MFA/device prompt), "
+                "or (4) AAD showed an error that blocked progression. "
+                f"page_hints={hints}"
             )
 
         # Password step
@@ -284,32 +742,40 @@ async def login(page: Page, username: str, password: str) -> None:
         if not await signin.first.is_visible(timeout=1500):
             signin = page.locator('input[type="submit"], button[type="submit"], #idSIButton9')
         await signin.first.click()
+        await page.wait_for_timeout(900)
+        await _microsoft_stay_signed_in_kmsi(page)
 
-        # "Stay signed in?" prompt (企業/学校アカウント)
-        try:
-            no_btn = page.get_by_role("button", name=re.compile(r"^(いいえ|No)$", re.I))
-            yes_btn = page.get_by_role("button", name=re.compile(r"^(はい|Yes)$", re.I))
-            if await no_btn.first.is_visible(timeout=5000):
-                await no_btn.first.click()
-            elif await yes_btn.first.is_visible(timeout=1200):
-                await yes_btn.first.click()
-        except Exception:
-            pass
-
-        # Wait until redirected back to the portal; if MFA/interaction is required, fail fast with a clear message.
+        # Wait until redirected back to the portal. MFA detection runs in parallel but must NOT time out
+        # when no MFA UI exists (the old wait_for_selector(30s) "lost" the race and aborted a good login).
         async def wait_portal() -> None:
             await page.wait_for_url(re.compile(r"https://cp-portal\.sapmed\.ac\.jp/.*"), timeout=90_000)
 
-        async def wait_mfa() -> None:
-            # Broad keyword net for common AAD step-up screens.
-            await page.wait_for_selector(
-                "text=追加の情報, text=承認, text=Authenticator, text=確認コード, text=コードを入力, text=MFA, text=Verify",
-                timeout=30_000,
-            )
-            raise RuntimeError("Microsoft sign-in requires additional interactive verification (MFA/step-up).")
+        async def wait_mfa_poll() -> None:
+            needles = [
+                re.compile(r"追加の情報"),
+                re.compile(r"Authenticator"),
+                re.compile(r"確認コード"),
+                re.compile(r"コードを入力"),
+                re.compile(r"\bMFA\b", re.I),
+                re.compile(r"\bVerify\b"),
+                # Japanese-aware (avoid a single fragile comma-separated selector)
+                re.compile(r"承認"),
+            ]
+            while True:
+                for rx in needles:
+                    try:
+                        if await page.get_by_text(rx).first.is_visible(timeout=120):
+                            raise RuntimeError(
+                                "Microsoft sign-in requires additional interactive verification (MFA/step-up)."
+                            )
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        continue
+                await asyncio.sleep(0.35)
 
         done, pending = await asyncio.wait(
-            {asyncio.create_task(wait_portal()), asyncio.create_task(wait_mfa())},
+            {asyncio.create_task(wait_portal()), asyncio.create_task(wait_mfa_poll())},
             return_when=asyncio.FIRST_COMPLETED,
         )
         for t in pending:
@@ -582,6 +1048,50 @@ def _parse_cell(text: str) -> tuple[str, time | None, time | None, str | None]:
     return (subject, start_t, end_t, room)
 
 
+def _infer_room_from_free_text(text: str) -> str | None:
+    """
+    When tooltip omits the 教室： label (or uses only inline patterns), still extract SMU-style rooms.
+    Examples: 白土：D101, D402, D502（多目的演習室）, ｳｨｰﾗｰ：D402, 3F-201
+    """
+    if not text or not str(text).strip():
+        return None
+    s = unicodedata.normalize("NFKC", text)
+    s = s.replace("\u3000", " ")
+
+    # Instructor/building prefix + room (数学などがこの形式で出ることが多い)
+    m = re.search(
+        r"(?:ｳｨｰﾗｰ|ウィーラー|白土|ｹｲﾝ|ケイン)\s*[:：]\s*([A-Za-z0-9（）・\-]+)",
+        s,
+    )
+    if m:
+        r0 = m.group(1).strip()
+        if r0 and r0 not in {":", "："}:
+            return r0
+
+    # 教研3F C301・C302 / 教研1F D101（教室ラベルなし本文のみのとき）
+    m = re.search(r"(教研\d+F\s+[^\n\r]+)", s)
+    if m:
+        r0 = m.group(1).strip()
+        if r0 and len(r0) >= 3:
+            return r0
+
+    # D### + optional Japanese suffix in parentheses
+    m = re.search(r"(D\d{3}(?:（[^）\n]+）)?)", s)
+    if m:
+        return m.group(1).strip()
+
+    # Room letter + digits (C302, D303)
+    m = re.search(r"\b([CD]\d{3,4})\b", s)
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(r"\b(\d+F[-‐]?\d{2,4})\b", s, re.I)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
 def _parse_tooltip_details(text: str) -> tuple[str | None, str | None, str | None, str | None]:
     """
     Parses tooltip text and returns (subject, period, room, code) if present.
@@ -590,6 +1100,7 @@ def _parse_tooltip_details(text: str) -> tuple[str | None, str | None, str | Non
       - 時限
       - 教室 / 場所
       - 科目コード / コード
+    Falls back to _infer_room_from_free_text when 教室 is missing (e.g. only 白土：D101).
     """
     s = re.sub(r"[\t\r]+", "\n", (text or "")).strip()
     s = re.sub(r"\n{2,}", "\n", s)
@@ -606,7 +1117,6 @@ def _parse_tooltip_details(text: str) -> tuple[str | None, str | None, str | Non
         period = m.group(1)
 
     room = None
-    # Room tends to be on the last line like: "教室：教研3F C301・C302"
     m = re.search(r"(?:教室|場所)\s*[:：]\s*([^\n]+)", s)
     if m:
         room = m.group(1).strip()
@@ -615,7 +1125,6 @@ def _parse_tooltip_details(text: str) -> tuple[str | None, str | None, str | Non
         if m:
             room = m.group(1).strip()
 
-    # Normalize empty-ish room strings (e.g. tooltip has '教室：' with no value)
     if room is not None:
         room = room.strip()
         if room in {"", ":", "：", "F", "Ｆ"}:
@@ -630,6 +1139,9 @@ def _parse_tooltip_details(text: str) -> tuple[str | None, str | None, str | Non
         if m:
             subject = m.group(1).strip()
             break
+
+    if room is None:
+        room = _infer_room_from_free_text(s) or _infer_room_from_free_text(one_line)
 
     return subject, period, room, code
 
@@ -721,6 +1233,266 @@ async def _read_visible_tooltip_text(page: Page) -> str | None:
     return best or None
 
 
+async def _calendar_event_date_iso(page: Page, ev) -> str | None:
+    """Map a FullCalendar fc-event anchor to YYYY-MM-DD via its table column."""
+    handle = await ev.element_handle()
+    if not handle:
+        return None
+    js = r"""
+    (el) => {
+      const td = el.closest('td');
+      if (!td) return null;
+      const idx = td.cellIndex;
+      const dates = Array.from(document.querySelectorAll('#calendar .fc-bg td.fc-day[data-date]'))
+        .map(x => x.getAttribute('data-date'))
+        .filter(Boolean);
+      const dayIdx = idx - 1;
+      if (dayIdx >= 0 && dayIdx < dates.length) return dates[dayIdx];
+      return null;
+    }
+    """
+    try:
+        return await page.evaluate(js, handle)
+    except Exception:
+        return None
+
+
+async def _hover_tooltip_for_fc_event(page: Page, ev, *, post_hover_ms: int = 450) -> str | None:
+    """Hover an fc-event and read portal tooltip (教室: line). Matches hover-mode robustness."""
+    try:
+        await ev.scroll_into_view_if_needed()
+    except Exception:
+        pass
+    tooltip_text: str | None = None
+    try:
+        try:
+            await page.mouse.move(0, 0)
+        except Exception:
+            pass
+        target = ev.locator(".fc-content").first
+        if await target.count():
+            await target.hover()
+        else:
+            await ev.hover()
+        await page.wait_for_timeout(post_hover_ms)
+        tooltip_text = await _read_visible_tooltip_text(page)
+        if not tooltip_text:
+            await page.wait_for_timeout(max(350, post_hover_ms))
+            tooltip_text = await _read_visible_tooltip_text(page)
+    except Exception:
+        tooltip_text = None
+
+    if not tooltip_text:
+        for attr in [
+            "data-original-title",
+            "data-bs-original-title",
+            "data-title",
+            "title",
+            "aria-label",
+            "data-content",
+        ]:
+            try:
+                v = await ev.get_attribute(attr)
+                if v and v.strip():
+                    tooltip_text = v.strip()
+                    break
+            except Exception:
+                continue
+
+    if not tooltip_text:
+        try:
+            tid = await ev.get_attribute("aria-describedby")
+            if tid:
+                t = page.locator(f"#{tid}")
+                if await t.first.is_visible(timeout=500) or await t.first.count():
+                    tooltip_text = (await t.first.inner_text(timeout=800)).strip()
+        except Exception:
+            pass
+
+    return tooltip_text
+
+
+def _subject_tokens_overlap(a: str, b: str) -> bool:
+    """Loose match for calendar title vs Notion subject (NFKC, casefold)."""
+    x = _nfkc(a).strip().casefold().replace("\u3000", " ")
+    y = _nfkc(b).strip().casefold().replace("\u3000", " ")
+    if not x or not y:
+        return False
+    if x in y or y in x:
+        return True
+    n = min(8, len(x), len(y))
+    return n >= 4 and x[:n] == y[:n]
+
+
+async def _build_room_map_from_calendar_hover(
+    page: Page,
+) -> dict[tuple[str, str], list[tuple[str | None, str]]]:
+    """(date_iso, period) -> [(room, title_subj_hint), ...] from each fc-event (multi if collisions)."""
+    from collections import defaultdict
+
+    events = page.locator("#calendar a.fc-day-grid-event.fc-event")
+    await events.first.wait_for(state="visible", timeout=30_000)
+    ev_count = await events.count()
+    room_lists: dict[tuple[str, str], list[tuple[str | None, str]]] = defaultdict(list)
+
+    for i in range(ev_count):
+        if i >= max(0, ev_count - 5):
+            await page.wait_for_timeout(280)
+
+        ev = events.nth(i)
+        date_str = await _calendar_event_date_iso(page, ev)
+
+        title_loc = ev.locator(".fc-title")
+        title = (
+            (await title_loc.first.inner_text(timeout=1500)).strip()
+            if await title_loc.count()
+            else (await ev.inner_text()).strip()
+        )
+        title = re.sub(r"\s+", " ", title)
+        m = re.match(r"^\D*(\d{1,2})\s*(.*)$", title)
+        if not m:
+            continue
+        period = m.group(1)
+        title_subj = (m.group(2) or "").strip() or title
+        subj_hint = _nfkc(title_subj).strip().casefold()
+
+        tooltip_text = await _hover_tooltip_for_fc_event(page, ev)
+        t_s, t_period, room, _code = _parse_tooltip_details(tooltip_text or "")
+        tip_subj = _nfkc(t_s or "").strip().casefold()
+        hint = tip_subj if tip_subj else subj_hint
+
+        final_period = _normalize_period_key(str(t_period or period or ""))
+        if not final_period:
+            continue
+
+        tooltip_day = _parse_tooltip_date(tooltip_text or "")
+        if tooltip_day:
+            final_day = tooltip_day
+        elif date_str:
+            final_day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        else:
+            continue
+
+        slot_key = (final_day.isoformat(), final_period)
+        room_lists[slot_key].append((room, hint))
+
+    logging.info("[ROOM_ENRICH] hover map slot_keys=%s (events=%s)", len(room_lists), ev_count)
+    return dict(room_lists)
+
+
+def _merge_rooms_from_hover_map(
+    items: list[ScheduleItem],
+    room_map: dict[tuple[str, str], list[tuple[str | None, str]]],
+) -> list[ScheduleItem]:
+    """Fill empty rooms using hover candidates; prefer row where title hint matches subject."""
+    out: list[ScheduleItem] = []
+    filled = 0
+    for it in items:
+        key = (it.day.isoformat(), _normalize_period_key(str(it.period)))
+        if _room_effectively_missing(it.room) and key in room_map:
+            cands = room_map[key]
+            it_sub = _nfkc(it.subject or "").strip().casefold()
+            chosen: str | None = None
+            for room, hint in cands:
+                if _room_effectively_missing(room):
+                    continue
+                if hint and it_sub and _subject_tokens_overlap(it.subject or "", hint):
+                    chosen = room
+                    break
+            if chosen is None:
+                non_empty = [(r, h) for r, h in cands if not _room_effectively_missing(r)]
+                if len(non_empty) == 1:
+                    chosen = non_empty[0][0]
+                elif non_empty:
+                    for room, hint in non_empty:
+                        if hint and it_sub and (it_sub in hint or hint in it_sub):
+                            chosen = room
+                            break
+                    if chosen is None:
+                        chosen = non_empty[0][0]
+            if chosen is not None:
+                filled += 1
+                out.append(
+                    ScheduleItem(
+                        day=it.day,
+                        period=it.period,
+                        subject=it.subject,
+                        start=it.start,
+                        end=it.end,
+                        room=chosen,
+                        code=it.code,
+                        raw=it.raw,
+                    )
+                )
+                continue
+        out.append(it)
+    if filled:
+        logging.info("[ROOM_ENRICH] filled %s empty room(s) from hover tooltips", filled)
+    return out
+
+
+async def _retry_hover_rooms_for_missing(page: Page, items: list[ScheduleItem]) -> list[ScheduleItem]:
+    """Slow hover + 추론: 일괄 호버에서 빠진 슬롯(例: 初年次セミナー)만 다시 시도."""
+    out = list(items)
+    missing_idx = [i for i, it in enumerate(out) if _room_effectively_missing(it.room)]
+    if not missing_idx:
+        return out
+    events = page.locator("#calendar a.fc-day-grid-event.fc-event")
+    try:
+        await events.first.wait_for(state="visible", timeout=20_000)
+    except Exception:
+        return out
+    n = await events.count()
+    for mi in missing_idx:
+        it = out[mi]
+        want_day = it.day.isoformat()
+        want_per = _normalize_period_key(str(it.period))
+        want_sub = _nfkc(it.subject or "").strip().casefold()
+        for _j in range(n):
+            ev = events.nth(_j)
+            date_str = await _calendar_event_date_iso(page, ev)
+            if date_str != want_day:
+                continue
+            title_loc = ev.locator(".fc-title")
+            title = (
+                (await title_loc.first.inner_text(timeout=1500)).strip()
+                if await title_loc.count()
+                else (await ev.inner_text()).strip()
+            )
+            title_one = re.sub(r"\s+", " ", title)
+            m = re.match(r"^\D*(\d{1,2})\s*(.*)$", title_one)
+            if not m:
+                continue
+            if _normalize_period_key(m.group(1)) != want_per:
+                continue
+            t_sub = _nfkc((m.group(2) or "").strip()).casefold()
+            if not (
+                want_sub in t_sub
+                or t_sub in want_sub
+                or _subject_tokens_overlap(it.subject or "", t_sub)
+            ):
+                continue
+            await page.wait_for_timeout(350)
+            tooltip_text = await _hover_tooltip_for_fc_event(page, ev, post_hover_ms=900)
+            _ts, _tp, room, _c = _parse_tooltip_details(tooltip_text or "")
+            if _room_effectively_missing(room) and tooltip_text:
+                room = _infer_room_from_free_text(tooltip_text)
+            if not _room_effectively_missing(room):
+                out[mi] = ScheduleItem(
+                    day=it.day,
+                    period=it.period,
+                    subject=it.subject,
+                    start=it.start,
+                    end=it.end,
+                    room=room,
+                    code=it.code,
+                    raw=(tooltip_text or it.raw)[:1900] if tooltip_text else it.raw,
+                )
+                logging.info("[ROOM_RETRY] filled room %s for %s P%s", room, want_day, want_per)
+                break
+    return out
+
+
 async def _goto_timetable(page: Page) -> None:
     for loc in [
         page.get_by_role("link", name=re.compile(r"履修時間割")),
@@ -784,12 +1556,16 @@ async def parse_weekly_blocks(page: Page) -> list[ScheduleItem]:
                 if (e.start && typeof e.start.format === 'function') startDate = e.start.format('YYYY-MM-DD');
                 else if (e.start && e.start._d) startDate = new Date(e.start._d).toISOString().slice(0, 10);
               } catch (_) {}
+              const xp = (e.extendedProps && typeof e.extendedProps === 'object') ? e.extendedProps : {};
+              const xpRoom = xp.room || xp.classroom || xp.place || xp.kyoushitsu || xp.Kyoushitsu || xp.busho || '';
+              const xpDesc = [xp.description, xp.biko, xp.note, xp.memo, xp.detail].filter(Boolean).join('\\n');
               return {
                 title: e.title || '',
                 startDate,
-                description: e.description || e.biko || e.note || '',
-                room: e.room || e.classroom || e.place || '',
-                code: e.code || e.subjectCode || '',
+                description: [e.description, e.biko, e.note, xpDesc].filter(Boolean).join('\\n'),
+                room: (e.room || e.classroom || e.place || xpRoom || ''),
+                code: e.code || e.subjectCode || xp.code || '',
+                extendedProps: xp,
               };
             });
           } catch (e) {
@@ -815,9 +1591,20 @@ async def parse_weekly_blocks(page: Page) -> list[ScheduleItem]:
             subject = (m.group(2) or "").strip() or title
 
             desc = str(e.get("description") or "").strip()
+            xp = e.get("extendedProps")
+            if isinstance(xp, dict):
+                for k, v in xp.items():
+                    if v is None or isinstance(v, (dict, list)):
+                        continue
+                    vs = str(v).strip()
+                    if vs:
+                        desc = f"{desc}\n{k}: {vs}".strip()
+
             t_subject, t_period, t_room, t_code = _parse_tooltip_details(desc)
 
             room = (str(e.get("room") or "").strip() or t_room or None)
+            if room is None:
+                room = _infer_room_from_free_text(subject) or _infer_room_from_free_text(title)
             code = (str(e.get("code") or "").strip() or t_code or None)
 
             out.append(
@@ -832,6 +1619,13 @@ async def parse_weekly_blocks(page: Page) -> list[ScheduleItem]:
             )
 
         if out:
+            # clientEvents() often omits room; same cells show 教室: in hover — fill gaps.
+            try:
+                room_map = await _build_room_map_from_calendar_hover(page)
+                out = _merge_rooms_from_hover_map(out, room_map)
+                out = await _retry_hover_rooms_for_missing(page, out)
+            except Exception as e:
+                logging.warning("[ROOM_ENRICH] failed, keeping clientEvents rooms only: %s", e)
             return out
 
     # Be strict: only the clickable event anchors (blue blocks).
@@ -844,34 +1638,11 @@ async def parse_weekly_blocks(page: Page) -> list[ScheduleItem]:
     if day_count == 0:
         raise RuntimeError("Could not locate calendar day columns (fc-day[data-date])")
 
-    # DOM-based date mapping is more reliable than bounding boxes (works in headless).
-    async def event_date_iso(ev) -> str | None:
-        handle = await ev.element_handle()
-        if not handle:
-            return None
-        js = r"""
-        (el) => {
-          const td = el.closest('td');
-          if (!td) return null;
-          const idx = td.cellIndex; // includes leading blank/time label column (usually 0)
-          const dates = Array.from(document.querySelectorAll('#calendar .fc-bg td.fc-day[data-date]'))
-            .map(x => x.getAttribute('data-date'))
-            .filter(Boolean);
-          const dayIdx = idx - 1;
-          if (dayIdx >= 0 && dayIdx < dates.length) return dates[dayIdx];
-          return null;
-        }
-        """
-        try:
-            return await page.evaluate(js, handle)
-        except Exception:
-            return None
-
     items: list[ScheduleItem] = []
     ev_count = await events.count()
     for i in range(ev_count):
         ev = events.nth(i)
-        date_str = await event_date_iso(ev)  # fallback only; tooltip date overrides if present
+        date_str = await _calendar_event_date_iso(page, ev)  # fallback only; tooltip date overrides if present
 
         # Title text usually includes leading period number, e.g. "1 医療倫理学"
         title_loc = ev.locator(".fc-title")
@@ -1242,7 +2013,11 @@ def _grid_to_items(grid: list[list[str]]) -> list[ScheduleItem]:
             len(items),
             non_empty_cells,
         )
-    logging.info("[PARSE_SUMMARY] extracted_items=%s non_empty_cells=%s", len(items), non_empty_cells)
+    logging.info(
+        "[PARSE_SUMMARY] extracted_items=%s non_empty_cells=%s (pre-postprocess)",
+        len(items),
+        non_empty_cells,
+    )
 
     return items
 
@@ -1279,9 +2054,15 @@ async def run(
             # (portal will redirect straight to dashboard).
             await login(page, user, pw)
             logging.info("Parsing weekly schedule...")
-            items = await parse_weekly_schedule(page, details_mode=details_mode)
-            items = apply_room_overrides(items)
+            items_parsed = await parse_weekly_schedule(page, details_mode=details_mode)
+            items = apply_room_overrides(items_parsed)
             items = apply_period_slot_times(items)
+            items = apply_user_schedule_postprocess(items)
+            items = apply_sibling_room_fallback(items)
+            items = apply_optional_room_hints(items)
+            conflicts = collect_room_conflicts(items_parsed, items)
+            write_room_conflicts_artifact(conflicts)
+            logging.info("[PIPELINE_ITEMS] final_rows=%s (after user postprocess)", len(items))
 
             if save_storage_state:
                 os.makedirs(os.path.dirname(save_storage_state) or ".", exist_ok=True)

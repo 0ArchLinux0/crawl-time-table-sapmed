@@ -1,3 +1,6 @@
 playwright
 python-dotenv
 requests
+tzdata>=2024.1
+python-telegram-bot>=21.0
+google-generativeai>=0.8.0

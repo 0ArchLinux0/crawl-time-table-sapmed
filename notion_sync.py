@@ -8,7 +8,9 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+import re
 from zoneinfo import ZoneInfo
 
 import requests
@@ -164,6 +166,50 @@ def _write_sync_log_entry(
             )
         else:
             raise
+
+
+def append_sync_warning_to_log_page(token: str, db_id: str, body: str) -> None:
+    """강의실 불일치 등 수동 확인 요청을 갱신 로그 페이지에 토글로 남긴다."""
+    page_id = _sync_log_target_page_id(token, db_id)
+    if not page_id:
+        logging.warning(
+            "append_sync_warning: DB parent page unknown; set NOTION_SYNC_LOG_PAGE_ID to append warnings."
+        )
+        return
+
+    now = datetime.now(SYNC_LOG_TZ).strftime("%Y-%m-%d %H:%M JST")
+    header = f"⚠️ 강의실 스크랩≠규칙 반영 — 수동 확인 ({now})"
+
+    def _rt(s: str) -> list[dict[str, Any]]:
+        chunk = (s or "").strip()[:1900] or "(empty)"
+        return [{"type": "text", "text": {"content": chunk}}]
+
+    chunks: list[str] = []
+    rest = (body or "").strip()
+    while rest:
+        chunks.append(rest[:1800])
+        rest = rest[1800:]
+
+    para_children: list[dict[str, Any]] = []
+    for part in chunks[:35]:
+        para_children.append(
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": _rt(part)},
+            }
+        )
+
+    toggle: dict[str, Any] = {
+        "object": "block",
+        "type": "toggle",
+        "toggle": {
+            "rich_text": _rt(header),
+            "children": para_children,
+        },
+    }
+    _notion_append_block_children(token, page_id, [toggle])
+    logging.info("Appended sync warning toggle to Notion page %s", page_id)
 
 
 def _to_iso(dt_date: str, hhmm: str | None, *, tz_offset: str = "+09:00") -> str:
@@ -674,7 +720,8 @@ def notion_create_or_update(
         prop_types=prop_types,
     )
 
-    title_text = f"[{row.room}] {row.subject}" if (row.room and row.room.strip()) else row.subject
+    # Title should be the subject only; room is stored in a separate property.
+    title_text = (row.subject or "").strip()
 
     period_type = (prop_types.get(prop_period) or "select").lower()
     room_type = (prop_types.get(prop_room) or "rich_text").lower()
@@ -725,6 +772,74 @@ def notion_create_or_update(
     logging.info("Created %s P%s (%s)", row.date, row.period, page_id)
 
 
+_TITLE_ROOM_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
+
+
+def normalize_subject_title(title: str) -> str:
+    """
+    Remove leading room prefix like:
+      - "[教研1F D101] 数学" -> "数学"
+    """
+    t = (title or "").strip()
+    t = _TITLE_ROOM_PREFIX_RE.sub("", t).strip()
+    # Collapse internal whitespace (Notion titles sometimes contain NBSP/newlines)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _query_all_pages(token: str, db_id: str) -> list[dict[str, Any]]:
+    url = f"{NOTION_API_BASE}/databases/{db_id}/query"
+    out: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        payload: dict[str, Any] = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        r = requests.post(url, headers=_notion_headers(token), json=payload, timeout=60)
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:800]}
+            raise RuntimeError(f"Notion query failed: {r.status_code} {body}")
+        data = r.json()
+        out.extend(data.get("results") or [])
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return out
+
+
+def repair_titles_in_database(*, token: str, db_id: str, prop_title: str) -> int:
+    """
+    Bulk-fix existing pages where the Title contains a room prefix like "[ROOM] subject".
+    Returns count of updated pages.
+    """
+    pages = _query_all_pages(token, db_id)
+    changed = 0
+    for p in pages:
+        if p.get("archived"):
+            continue
+        pid = p.get("id")
+        if not pid:
+            continue
+        old = _get_title(p, prop_title)
+        new = normalize_subject_title(old)
+        if not old or old == new:
+            continue
+        url = f"{NOTION_API_BASE}/pages/{pid}"
+        payload = {"properties": {prop_title: {"title": [{"text": {"content": new}}]}}}
+        r = requests.patch(url, headers=_notion_headers(token), json=payload, timeout=30)
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:500]}
+            raise RuntimeError(f"Title repair failed for {pid}: {r.status_code} {body}")
+        changed += 1
+    return changed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Upsert SMU schedule JSON into Notion database")
     ap.add_argument("--input", default=None, help="Path to JSON file from scraper.py (default: stdin)")
@@ -754,15 +869,38 @@ def main() -> None:
         help="Do not append 갱신 이력 (toggle/bullet) to a Notion page.",
     )
     ap.add_argument(
+        "--repair-titles",
+        action="store_true",
+        help="기존 DB의 강의명(Title)에서 '[강의실] ' 접두어를 제거해 일괄 정리.",
+    )
+    ap.add_argument(
+        "--repair-titles-only",
+        action="store_true",
+        help="제목 정리만 수행하고 종료(JSON upsert·갱신 로그 생략). 마이그레이션용.",
+    )
+    ap.add_argument(
         "--sync-log-style",
         choices=["toggle", "bullet"],
         default=None,
         help="Sync history block style (default: NOTION_SYNC_LOG_STYLE env or toggle).",
     )
+    ap.add_argument(
+        "--append-sync-warning-file",
+        default=None,
+        metavar="PATH",
+        help="갱신 로그 페이지에 경고 블록만 추가하고 종료(내용 UTF-8 파일).",
+    )
     args = ap.parse_args()
 
     _setup_logging(args.log_level)
     load_dotenv()
+
+    if args.append_sync_warning_file:
+        token = _env("NOTION_TOKEN") or ""
+        db_id = _env("NOTION_DB_ID") or ""
+        text = Path(args.append_sync_warning_file).read_text(encoding="utf-8")
+        append_sync_warning_to_log_page(token, db_id, text)
+        return
 
     token = _env("NOTION_TOKEN") or ""
     db_id = _env("NOTION_DB_ID") or ""
@@ -788,8 +926,17 @@ def main() -> None:
         else:
             logging.info("Notion property %r type=%s", key, t)
 
+    if args.repair_titles_only:
+        fixed = repair_titles_in_database(token=token, db_id=db_id, prop_title=resolved.prop_title)
+        logging.warning("repair-titles-only: updated %s page title(s); skipping upsert", fixed)
+        return
+
     rows = _read_rows(args.input)
     logging.info("Loaded %s rows from scraper JSON", len(rows))
+
+    if args.repair_titles:
+        fixed = repair_titles_in_database(token=token, db_id=db_id, prop_title=resolved.prop_title)
+        logging.warning("repair-titles: updated %s page title(s)", fixed)
 
     if args.wipe_first:
         logging.warning("wipe-first: 전체 아카이브 후 재삽입 모드")

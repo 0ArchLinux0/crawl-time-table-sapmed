@@ -8,8 +8,13 @@ __pycache__/
 
 # Generated & debug (keep empty artifacts/ via .gitkeep)
 schedule.json
+room_hints.json
 artifacts/*
 !artifacts/.gitkeep
+
+# Bot / worker logs (keep logs/.gitkeep)
+logs/*
+!logs/.gitkeep
 
 # Editor
 .cursor/
